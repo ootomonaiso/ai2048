@@ -1,0 +1,13 @@
+# Trained checkpoints / logs (huge: 16^TUPLE_LEN float32 tables, up to GBs)
+runs/
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+# Claude Code local
+.claude/
