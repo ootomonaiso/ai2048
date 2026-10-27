@@ -35,19 +35,36 @@ A from-scratch 2048 game plus two AIs over a numba-JIT bitboard engine:
   resume unchanged). Plain TD(0)+TC learns fast at first, then plateaus
   hard (e.g. a 5-tuple run gained almost nothing from 0.2M → 10M games)
   and barely trains the rare 16384/32768 endgame, because fresh self-play
-  almost never reaches it. Three cheap, literature-backed fixes:
-  - `--opt-init V` — **optimistic initialization**: start every board's
-    value at `V` so the greedy policy explores and early returns converge
-    faster (Jaśkowski 2017).
-  - `--tc-alpha-floor F` — a lower bound on the per-weight TC learning
-    rate. Vanilla TC drives the rate to 0 for noise-chasing weights, which
-    also *freezes weights prematurely* while the policy is still improving
-    (a cause of the plateau); a small floor (0.01) keeps them plastic.
+  almost never reaches it.
   - `--restart-prob P` / `--restart-min-exp E` — **restart / carousel
     shaping**: start a fraction `P` of games from a pool of
     previously-seen afterstates whose max tile ≥ `2**E`, so self-play
-    actually *practises* the endgame (Jaśkowski 2018 carousel). This is
-    the main lever for reaching 16384/32768 without just burning compute.
+    actually *practises* the endgame (Jaśkowski 2018 carousel). **Enable
+    this LATE** — once a run already reaches 8192 reliably — with a high
+    `E` (e.g. 14) so only real endgame states enter the pool. Turning it
+    on from scratch with a low `E` *hurts* (it restarts the still-clumsy
+    net into states it can't handle, distorting the early distribution;
+    measured worse than baseline over 300k games).
+  - `--opt-init V` — **optimistic initialization** (Jaśkowski 2017):
+    start every board's value at `V` (canonical ≈320000). **Caveat for
+    THIS repo:** OI only pays off with a high learning rate that quickly
+    burns off the initial optimism. Our plain TC can't run `--lr 1.0`
+    stably (it chases spawn-noise variance and diverges — even with OI),
+    and at the safe `--lr 0.1` a large `--opt-init` just causes a long
+    unrecovered dip (both measured, 300k games, decisively below
+    baseline). Making OI useful here needs **delayed TC** (not yet
+    implemented) to tame the variance and unlock `--lr 1.0`. Leave at 0
+    until then.
+  - `--tc-alpha-floor F` — a lower bound on the per-weight TC learning
+    rate so vanilla TC can't freeze a weight to 0 permanently (an
+    anti-plateau safeguard; this one is ours, not from the papers).
+
+  **Honest status:** on short (300k-game) A/B runs none of these beat the
+  plain baseline — the baseline is already well-tuned for the early/mid
+  game, and restart shaping's real payoff is only in the endgame regime
+  that short runs never reach. They are tools for the LONG endgame-push
+  run, not early-curve wins. The genuinely missing algorithmic piece is
+  delayed TC (to make a high learning rate + optimistic init viable).
 
 ```
 # train (resumable; Ctrl-C any time, re-run to continue):
@@ -57,14 +74,11 @@ python train.py --ckpt runs/ms2_5t8 --stage-thresholds 14 --init-from runs/s1_5t
 # for the higher ceiling once RAM is free (6-tuples, ~1.6GB+):
 AI2048_NTUPLE=6t8 python train.py --ckpt runs/s1_6t8
 
-# "work smarter, not harder" recipe (OTD: optimistic TD + TC). The high
-# lr is SAFE here *because* of --opt-init: every board starts valued at
-# ~320k so early TD errors are small state-to-state differences, not the
-# full-target overshoot that makes lr 1.0 diverge from a zero start. This
-# is the canonical fast recipe (moporgic/TDL2048), plus restart shaping to
-# train the rare endgame plain self-play never visits:
-python train.py --ckpt runs/s2_5t8 --opt-init 320000 --lr 1.0 \
-    --tc-alpha-floor 0.01 --restart-prob 0.25 --restart-min-exp 13
+# Restart/carousel shaping, enabled LATE (after a run already reaches 8192
+# reliably) to push the rare 16384/32768 endgame that fresh self-play never
+# visits. Use the SAFE lr 0.1 and a HIGH min-exp so only genuine endgame
+# states enter the pool. Do NOT turn this on from scratch (see note below).
+python train.py --ckpt runs/ms2_5t8 --restart-prob 0.25 --restart-min-exp 14
 
 # evaluate a trained net at various search depths:
 python -c "from ai2048.netsearch import load_weights, load_thresholds, make_policy; \

@@ -31,11 +31,26 @@ def _now():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _replace_retry(src, dst, tries=10, delay=0.5):
+    """os.replace with retries. On Windows an antivirus/search-indexer can
+    briefly hold a newly-written file, making os.replace raise
+    PermissionError (WinError 5); without a retry that kills a checkpoint
+    save mid-run (observed). Back off and retry a few times."""
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(delay)
+
+
 def _save_array(ckpt_dir, name, arr):
     path = os.path.join(ckpt_dir, name + ".npy")
     tmp = os.path.join(ckpt_dir, name + ".tmp.npy")
     np.save(tmp, arr)
-    os.replace(tmp, path)
+    _replace_retry(tmp, path)
 
 
 def save_ckpt(ckpt_dir, weights, E, A, meta):
@@ -47,7 +62,7 @@ def save_ckpt(ckpt_dir, weights, E, A, meta):
     tmp = meta_path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(meta, f, indent=2)
-    os.replace(tmp, meta_path)
+    _replace_retry(tmp, meta_path)
 
 
 def load_ckpt(ckpt_dir):
@@ -82,10 +97,9 @@ def main():
     parser = argparse.ArgumentParser(description="Train the 2048 N-tuple net (TD-afterstate+TC)")
     parser.add_argument("--ckpt", default="runs/ntuple1", help="checkpoint directory")
     parser.add_argument("--lr", type=float, default=0.1, help="base learning rate (TC on top). "
-                        "0.1 learns well from a ZERO start; 1.0 diverges from zero (chases spawn "
-                        "noise). BUT with --opt-init (optimistic init) 1.0 is stable AND much faster "
-                        "-- OI makes early TD errors small state-to-state differences, not full-target "
-                        "overshoot. The canonical OTD recipe is --opt-init 320000 --lr 1.0.")
+                        "0.1 learns well. 1.0 DIVERGES here -- with plain TC it chases spawn-noise "
+                        "variance (measured: diverges even WITH --opt-init). Running lr 1.0 stably "
+                        "would need delayed TC (not implemented). Keep 0.1.")
     parser.add_argument("--batch", type=int, default=256, help="self-play games per parallel batch")
     parser.add_argument("--ckpt-every", type=int, default=100000, help="games between checkpoints")
     parser.add_argument("--eval-every", type=int, default=50000, help="games between evaluations")
@@ -100,10 +114,10 @@ def main():
     # --- learning-curve levers (all default to the plain baseline) ------
     parser.add_argument("--opt-init", type=float, default=0.0, help="OPTIMISTIC INITIALIZATION: on a "
                         "FRESH run, start every board's value V at this number (0 = plain zero start). "
-                        "The canonical OTD value is ~320000 (approx the achievable avg score; "
-                        "moporgic/TDL2048 uses 4x6patt=320000/norm). Accelerates early learning, "
-                        "drives exploration, and makes a high --lr (1.0) stable. Ignored on resume "
-                        "and with --init-from.")
+                        "Canonical OTD value ~320000. CAVEAT: OI only helps with a high lr that burns "
+                        "off the optimism fast; our plain TC can't run lr 1.0 stably, and at lr 0.1 a "
+                        "big opt-init just causes a long dip (measured below baseline over 300k games). "
+                        "Needs delayed TC to be useful. Leave 0 until then. Ignored on resume/--init-from.")
     parser.add_argument("--tc-alpha-floor", type=float, default=0.0, help="lower bound on the per-weight "
                         "TC learning rate (0 = plain TC). A small value (e.g. 0.01) keeps frozen weights "
                         "minimally plastic, helping training push past the mid-run plateau.")
