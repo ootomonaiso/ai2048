@@ -186,24 +186,48 @@ def best_move_net(board, weights, thresholds, sym_patterns):
 
 # --- one self-play game with TD-afterstate(+TC) learning --------------
 @njit(cache=True)
-def play_and_learn_one(seed, weights, E, A, thresholds, sym_patterns, lr):
+def play_and_learn_one(seed, weights, E, A, thresholds, sym_patterns, lr,
+                       alpha_floor, start_board, collect_min_exp):
     """Play one game greedily under the current net while applying
     TD-afterstate + TC updates. Multistage: each afterstate is valued and
     updated at its own stage (empty `thresholds` -> single stage). The TD
     target for V_{stage(after)}(after) is reward2 + V_{stage(after2)}(after2)
-    and may cross a stage boundary (standard). Returns (score, max_exp).
-    `seed` must be nonzero."""
+    and may cross a stage boundary (standard). `seed` must be nonzero.
+
+    RESTART / CAROUSEL SHAPING. If `start_board` is nonzero, the game does
+    NOT start from an empty board -- it resumes from `start_board` (a
+    previously-encountered afterstate), so self-play spends time in the
+    rare late-game region that fresh games almost never reach. This is the
+    fix for the hard plateau on 16384/32768: those positions' weights only
+    get trained if the learner actually visits them. (start_board=0 = the
+    normal empty start.)
+
+    POOL COLLECTION. If `collect_min_exp > 0`, the game reservoir-samples
+    ONE afterstate whose max-tile exponent is >= collect_min_exp and
+    returns it as `deep` (0 if none qualified), so the driver can grow a
+    pool of high-tile states to restart future games from. Uniform over
+    all qualifying afterstates in the game (reservoir sampling).
+
+    Returns (score, max_exp, deep_afterstate)."""
     state = np.uint64(seed)
     if state == np.uint64(0):
         state = np.uint64(0x9E3779B97F4A7C15)
 
-    board, state = _init_board(state)
+    if start_board != np.uint64(0):
+        # resume from a pooled afterstate
+        after = start_board
+        v_after = NT.evaluate(after, weights, _stage_of(after, thresholds), sym_patterns)
+        score = np.int64(0)
+    else:
+        board, state = _init_board(state)
+        after, reward, legal, best_val = _greedy(board, weights, thresholds, sym_patterns)
+        if not legal:
+            return 0, _max_exponent(board), np.uint64(0)
+        score = np.int64(reward)
+        v_after = best_val - reward  # = V_{stage(after)}(after)
 
-    after, reward, legal, best_val = _greedy(board, weights, thresholds, sym_patterns)
-    if not legal:
-        return 0, _max_exponent(board)
-    score = np.int64(reward)
-    v_after = best_val - reward  # = V_{stage(after)}(after)
+    deep = np.uint64(0)
+    seen_high = np.uint64(0)
 
     while True:
         # spawn a random tile onto the afterstate -> next state
@@ -213,24 +237,39 @@ def play_and_learn_one(seed, weights, E, A, thresholds, sym_patterns, lr):
         if not legal2:
             # terminal: target 0 future reward
             err = 0.0 - v_after
-            NT.update(after, weights, E, A, stage_after, sym_patterns, lr * err)
-            return score, _max_exponent(board)
+            NT.update(after, weights, E, A, stage_after, sym_patterns, lr * err, alpha_floor)
+            return score, _max_exponent(board), deep
         target = best_val2  # = reward2 + V_{stage(after2)}(after2)
         err = target - v_after
-        NT.update(after, weights, E, A, stage_after, sym_patterns, lr * err)
+        NT.update(after, weights, E, A, stage_after, sym_patterns, lr * err, alpha_floor)
         score += reward2
+        # reservoir-sample a high-tile afterstate for the restart pool
+        if collect_min_exp > 0 and _max_exponent(after2) >= collect_min_exp:
+            seen_high += np.uint64(1)
+            r, state = _xorshift(state)
+            if (r % seen_high) == np.uint64(0):
+                deep = after2
         after = after2
         v_after = best_val2 - reward2  # = V_{stage(after2)}(after2)
 
 
 @njit(cache=True, parallel=True)
-def train_batch(seeds, weights, E, A, thresholds, sym_patterns, lr, out_score, out_maxexp):
+def train_batch(seeds, weights, E, A, thresholds, sym_patterns, lr,
+                alpha_floor, start_boards, collect_min_exp,
+                out_score, out_maxexp, out_deepboard):
     """Play len(seeds) games in parallel (Hogwild updates to the shared
-    weights/E/A). Writes per-game (score, max_exponent) into the output
-    arrays. Each game uses its own RNG seed so parallelism is deterministic
-    per seed and thread-safe."""
+    weights/E/A). Writes per-game (score, max_exponent, deep_afterstate)
+    into the output arrays. Each game uses its own RNG seed so parallelism
+    is deterministic per seed and thread-safe.
+
+    `alpha_floor` -> TC learning-rate floor (see ntuple.update).
+    `start_boards[i]` -> restart afterstate for game i (0 = empty start).
+    `collect_min_exp` -> pool-collection tile threshold (0 = no pooling)."""
     n = seeds.shape[0]
     for i in prange(n):
-        s, mx = play_and_learn_one(seeds[i], weights, E, A, thresholds, sym_patterns, lr)
+        s, mx, deep = play_and_learn_one(
+            seeds[i], weights, E, A, thresholds, sym_patterns, lr,
+            alpha_floor, start_boards[i], collect_min_exp)
         out_score[i] = s
         out_maxexp[i] = mx
+        out_deepboard[i] = deep

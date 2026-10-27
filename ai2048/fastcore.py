@@ -297,9 +297,6 @@ def best_move_fast(board, time_limit=0.3, min_depth=3, max_depth=9, weights=None
     w_empty, w_merge, w_mono, corner_bonus_w, w_smooth = weights
 
     board_u = np.uint64(board)
-    best_scores = None
-    elapsed_history = []
-    depth = min_depth
     t_start = time.perf_counter()
 
     DEFAULT_GROWTH_GUESS = 25.0  # conservative guess before we have 2 data points
@@ -309,6 +306,17 @@ def best_move_fast(board, time_limit=0.3, min_depth=3, max_depth=9, weights=None
     SAFETY_MARGIN = 1.5
     MIN_REMAINING = 0.002  # don't even attempt a depth with near-zero budget left
     HALF_BUDGET_STOP = 0.5  # if the last depth alone ate this fraction of the budget, stop
+
+    # Always complete the min_depth search FIRST, unconditionally, before
+    # any budget gate. Otherwise a tight/misconfigured budget (time_limit
+    # near 0, or min_depth > max_depth) would exit the loop having run no
+    # search at all and return None -- which callers read as "no legal
+    # move" and resign on a perfectly playable board. (netsearch's timed
+    # driver guarantees its min_depth pass the same way.)
+    t0 = time.perf_counter()
+    best_scores = search_root(board_u, min_depth, w_empty, w_merge, w_mono, corner_bonus_w, w_smooth)
+    elapsed_history = [time.perf_counter() - t0]
+    depth = min_depth + 1
 
     while depth <= max_depth:
         remaining = time_limit - (time.perf_counter() - t_start)

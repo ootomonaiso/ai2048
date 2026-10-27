@@ -31,6 +31,23 @@ A from-scratch 2048 game plus two AIs over a numba-JIT bitboard engine:
 - **Inference** (`netsearch.py`): expectimax whose leaves are scored by
   the trained net. `depth=0` = 1-ply afterstate-greedy (fastest);
   `depth>=1` adds chance/search layers (much stronger).
+- **Learning-curve levers** (`train.py`, all default-off so existing runs
+  resume unchanged). Plain TD(0)+TC learns fast at first, then plateaus
+  hard (e.g. a 5-tuple run gained almost nothing from 0.2M → 10M games)
+  and barely trains the rare 16384/32768 endgame, because fresh self-play
+  almost never reaches it. Three cheap, literature-backed fixes:
+  - `--opt-init V` — **optimistic initialization**: start every board's
+    value at `V` so the greedy policy explores and early returns converge
+    faster (Jaśkowski 2017).
+  - `--tc-alpha-floor F` — a lower bound on the per-weight TC learning
+    rate. Vanilla TC drives the rate to 0 for noise-chasing weights, which
+    also *freezes weights prematurely* while the policy is still improving
+    (a cause of the plateau); a small floor (0.01) keeps them plastic.
+  - `--restart-prob P` / `--restart-min-exp E` — **restart / carousel
+    shaping**: start a fraction `P` of games from a pool of
+    previously-seen afterstates whose max tile ≥ `2**E`, so self-play
+    actually *practises* the endgame (Jaśkowski 2018 carousel). This is
+    the main lever for reaching 16384/32768 without just burning compute.
 
 ```
 # train (resumable; Ctrl-C any time, re-run to continue):
@@ -39,6 +56,15 @@ python train.py --ckpt runs/s1_5t8 --lr 0.1 --batch 512
 python train.py --ckpt runs/ms2_5t8 --stage-thresholds 14 --init-from runs/s1_5t8
 # for the higher ceiling once RAM is free (6-tuples, ~1.6GB+):
 AI2048_NTUPLE=6t8 python train.py --ckpt runs/s1_6t8
+
+# "work smarter, not harder" recipe (OTD: optimistic TD + TC). The high
+# lr is SAFE here *because* of --opt-init: every board starts valued at
+# ~320k so early TD errors are small state-to-state differences, not the
+# full-target overshoot that makes lr 1.0 diverge from a zero start. This
+# is the canonical fast recipe (moporgic/TDL2048), plus restart shaping to
+# train the rare endgame plain self-play never visits:
+python train.py --ckpt runs/s2_5t8 --opt-init 320000 --lr 1.0 \
+    --tc-alpha-floor 0.01 --restart-prob 0.25 --restart-min-exp 13
 
 # evaluate a trained net at various search depths:
 python -c "from ai2048.netsearch import load_weights, load_thresholds, make_policy; \
@@ -161,10 +187,13 @@ real settings, so they're what's shipped.
 
 ## Known limits
 
-- Tiles are stored in 4 bits, so the engine supports up to `2**15 = 32768`
-  per cell. Reaching 65536 would overflow — not a realistic concern,
-  since even reliably reaching 32768 is near the practical ceiling for
-  this kind of heuristic-Expectimax bot.
+- Tiles are stored in 4 bits, so the top representable tile is
+  `2**15 = 32768` (exponent 15). Two 32768 tiles therefore **do not
+  merge** — 32768 is a terminal max tile (the row tables in `tables.py`
+  explicitly block the `exp15 + exp15` merge, which would otherwise
+  overflow the 4-bit cell to exponent 0 and silently delete both tiles).
+  `tests/test_tables.py` guards this (tile-mass conservation over all
+  65536 rows). Reaching 65536 is simply out of scope for a 4-bit board.
 - The heuristic weights (`W_EMPTY`, `W_MERGE`, `W_MONO`, `CORNER_BONUS` in
   `fastcore.py`) are reasonable hand-picked defaults inspired by publicly
   documented 2048-AI designs, not auto-tuned; tuning them further (e.g.

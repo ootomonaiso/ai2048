@@ -154,11 +154,12 @@ def make_child(pop, fits, rng):
 
 # --- checkpoint helpers ----------------------------------------------
 def atomic_save_npy(path, arr):
-    tmp = path + ".tmp"
+    # Temp name already ends in .npy so np.save writes it verbatim (no
+    # appended suffix to guess at) -- deterministic, and immune to a stale
+    # "<path>.tmp" from a prior crash being promoted over the real output.
+    # Mirrors train.py's _save_array. Callers pass paths ending in .npy.
+    tmp = path + ".tmp.npy"
     np.save(tmp, arr)
-    # np.save appends .npy if missing
-    if not os.path.exists(tmp) and os.path.exists(tmp + ".npy"):
-        tmp = tmp + ".npy"
     os.replace(tmp, path)
 
 

@@ -25,13 +25,21 @@ def _pack_row(cells):
     return r
 
 
+MAX_EXPONENT = 15  # cells are 4 bits -> exponent 15 (32768) is the top tile
+
+
 def _slide_merge_left(cells):
     tiles = [c for c in cells if c]
     merged = []
     score = 0
     i = 0
     while i < len(tiles):
-        if i + 1 < len(tiles) and tiles[i] == tiles[i + 1]:
+        # Two equal tiles merge into exponent+1 -- but only while that
+        # stays within a 4-bit cell. Merging two exponent-15 (32768) tiles
+        # would need exponent 16, which overflows the 4 bits and silently
+        # wraps to 0 (both tiles vanish while still scoring). So 32768 is
+        # treated as a terminal max tile: two of them do NOT combine.
+        if i + 1 < len(tiles) and tiles[i] == tiles[i + 1] and tiles[i] < MAX_EXPONENT:
             v = tiles[i] + 1
             merged.append(v)
             score += 1 << v

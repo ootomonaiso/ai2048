@@ -157,10 +157,22 @@ SYM_PATTERNS = _build_sym_patterns()
 
 
 # --- Storage constructors --------------------------------------------
-def make_weights(num_stages=1):
-    """Zero weight table, shape (num_stages, NUM_BASE, 16**6), float32.
-    ~0.5 GB per stage -- see module docstring."""
-    return np.zeros((num_stages, NUM_BASE, INDEX_SIZE), dtype=np.float32)
+def make_weights(num_stages=1, init_v=0.0):
+    """Weight table, shape (num_stages, NUM_BASE, 16**6), float32.
+    ~0.5 GB per stage -- see module docstring.
+
+    `init_v` = OPTIMISTIC INITIALIZATION target: every weight is set so
+    that the initial value V(any board) == init_v (since V sums NUM_BASE*8
+    entries, each entry starts at init_v / (NUM_BASE*8)). init_v=0 gives
+    the plain zero start. A positive init_v makes the agent optimistic
+    about unseen states, which both accelerates early learning and keeps
+    the greedy policy exploring until real returns pull V down -- a
+    well-documented win for N-tuple 2048 (Jaskowski 2017). Pick init_v on
+    the order of an early-achievable score (e.g. a few x10^4)."""
+    w = np.zeros((num_stages, NUM_BASE, INDEX_SIZE), dtype=np.float32)
+    if init_v != 0.0:
+        w[:] = np.float32(init_v / (NUM_BASE * NUM_SYM))
+    return w
 
 
 def make_tc_accumulators(num_stages=1):
@@ -213,23 +225,30 @@ def evaluate(board, weights, stage, sym_patterns):
 
 
 @njit(cache=True)
-def update(board, weights, E, A, stage, sym_patterns, delta):
+def update(board, weights, E, A, stage, sym_patterns, delta, alpha_floor=0.0):
     """Apply a TC (temporal-coherence) update spreading `delta` evenly
     across all NUM_BASE*8 touched weight entries.
 
     For each touched entry: per-weight learning rate
-        alpha = |E[entry]| / A[entry]   (1.0 when A == 0)
+        alpha = max(|E[entry]| / A[entry], alpha_floor)   (1.0 when A == 0)
     computed from the CURRENT accumulators, then
         w[entry]  += alpha * delta_share
         E[entry]  += delta_share
         A[entry]  += |delta_share|
     with delta_share = delta / (NUM_BASE*8).
 
-    This is a concrete, standard TC formulation; REVIEW whether the
-    project wants exactly this (e.g. coherence computed per logical
-    weight before symmetry splitting, or a different error-sharing
-    convention). The learner may bypass this and write weights directly
-    if it wants a different update rule.
+    `alpha_floor` (default 0.0 = plain TC) is a LOWER BOUND on the per-
+    weight learning rate. Vanilla TC drives alpha -> 0 for any weight
+    whose updates keep flipping sign (|E| stays small while A grows), i.e.
+    it FREEZES that weight. That is usually desirable (stop chasing spawn
+    noise), but it also freezes weights prematurely while the policy is
+    still improving -- a cause of the hard mid-training plateau. A small
+    floor (e.g. 0.01) keeps every weight minimally plastic so learning can
+    keep improving past the plateau, at the cost of a little residual
+    noise-chasing.
+
+    This is a concrete, standard TC formulation; the learner may bypass
+    this and write weights directly if it wants a different update rule.
     """
     nbase = sym_patterns.shape[0]
     nsym = sym_patterns.shape[1]
@@ -244,6 +263,8 @@ def update(board, weights, E, A, stage, sym_patterns, delta):
                 e_val = E[stage, b, idx]
                 abs_e = e_val if e_val >= 0.0 else -e_val
                 alpha = abs_e / a_val
+                if alpha < alpha_floor:
+                    alpha = alpha_floor
             else:
                 alpha = 1.0
             weights[stage, b, idx] += np.float32(alpha * delta_share)
