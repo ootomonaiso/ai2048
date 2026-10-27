@@ -127,6 +127,12 @@ def main():
                         "learning that fresh games almost never reach.")
     parser.add_argument("--restart-min-exp", type=int, default=13, help="min max-tile EXPONENT a state "
                         "must reach to enter the restart pool (13 = 8192). Only used if --restart-prob>0.")
+    parser.add_argument("--td-lambda", type=float, default=0.0, help="DELAYED-TC(lambda): TD(lambda) "
+                        "decay for the delayed temporal-coherence learner (0 = plain online TD(0), the "
+                        "default/validated path). lam in (0,1) applies the forward-view lambda-return "
+                        "error per afterstate (weights held fixed within an episode, updated in one "
+                        "backward pass), cutting spawn-noise variance so a higher --lr becomes viable. "
+                        "Try e.g. --td-lambda 0.5 --lr 0.5 (or push --lr toward 1.0).")
     args = parser.parse_args()
 
     thresholds = np.array(
@@ -199,6 +205,8 @@ def main():
                             f"min_exp={args.restart_min_exp} ({1 << args.restart_min_exp})")
     if args.tc_alpha_floor != 0.0:
         log_line(args.ckpt, f"[{_now()}] TC alpha floor = {args.tc_alpha_floor:g}")
+    if args.td_lambda != 0.0:
+        log_line(args.ckpt, f"[{_now()}] delayed-TC(lambda) ON: lambda={args.td_lambda:g} lr={args.lr:g}")
 
     games = meta["games"]
     last_ckpt = games
@@ -234,7 +242,7 @@ def main():
                 start_boards = zero_starts
 
             TK.train_batch(seeds, weights, E, A, thresholds, sym, args.lr,
-                           args.tc_alpha_floor, start_boards, collect_min_exp,
+                           args.tc_alpha_floor, start_boards, collect_min_exp, args.td_lambda,
                            out_score, out_maxexp, out_deepboard)
 
             # fold this batch's sampled high-tile states into the pool
@@ -281,6 +289,7 @@ def main():
                 meta["tc_alpha_floor"] = args.tc_alpha_floor
                 meta["restart_prob"] = args.restart_prob
                 meta["restart_min_exp"] = args.restart_min_exp
+                meta["td_lambda"] = args.td_lambda
                 save_ckpt(args.ckpt, weights, E, A, meta)
                 log_line(args.ckpt, f"[{_now()}] checkpoint saved at {games:,} games "
                                     f"({meta['wall_seconds']/3600:.2f}h wall)")
@@ -294,6 +303,7 @@ def main():
     meta["tc_alpha_floor"] = args.tc_alpha_floor
     meta["restart_prob"] = args.restart_prob
     meta["restart_min_exp"] = args.restart_min_exp
+    meta["td_lambda"] = args.td_lambda
     save_ckpt(args.ckpt, weights, E, A, meta)
     log_line(args.ckpt, f"[{_now()}] final checkpoint saved at {games:,} games")
 

@@ -185,9 +185,12 @@ def best_move_net(board, weights, thresholds, sym_patterns):
 
 
 # --- one self-play game with TD-afterstate(+TC) learning --------------
+_LAMBDA_MAXT = 4096  # trajectory buffer per game for the lambda-return path
+
+
 @njit(cache=True)
 def play_and_learn_one(seed, weights, E, A, thresholds, sym_patterns, lr,
-                       alpha_floor, start_board, collect_min_exp):
+                       alpha_floor, start_board, collect_min_exp, lam):
     """Play one game greedily under the current net while applying
     TD-afterstate + TC updates. Multistage: each afterstate is valued and
     updated at its own stage (empty `thresholds` -> single stage). The TD
@@ -208,6 +211,18 @@ def play_and_learn_one(seed, weights, E, A, thresholds, sym_patterns, lr,
     pool of high-tile states to restart future games from. Uniform over
     all qualifying afterstates in the game (reservoir sampling).
 
+    DELAYED-TC(lambda). `lam`=0 -> plain online TD(0): each afterstate is
+    updated immediately by its 1-step error (the original, validated path,
+    byte-identical). `lam`>0 -> forward-view TD(lambda) (Jaskowski's
+    delayed TC): the whole episode is played with the weights held FIXED
+    (so delta_t are consistent), then updates are applied in one backward
+    pass where each afterstate's error is the lambda-return error
+    Delta_t = delta_t + lam*Delta_{t+1} = sum_k lam^k delta_{t+k}. Mixing
+    multi-step returns cuts the single-sample spawn-noise variance that
+    makes a high lr diverge under plain TC, which is what lets lr approach
+    1.0. The TC accumulators E/A then accumulate these Delta shares (E+=D,
+    A+=|D|), exactly as in the paper's Algorithm 4.
+
     Returns (score, max_exp, deep_afterstate)."""
     state = np.uint64(seed)
     if state == np.uint64(0):
@@ -216,6 +231,7 @@ def play_and_learn_one(seed, weights, E, A, thresholds, sym_patterns, lr,
     if start_board != np.uint64(0):
         # resume from a pooled afterstate
         after = start_board
+        board = start_board
         v_after = NT.evaluate(after, weights, _stage_of(after, thresholds), sym_patterns)
         score = np.int64(0)
     else:
@@ -229,33 +245,78 @@ def play_and_learn_one(seed, weights, E, A, thresholds, sym_patterns, lr,
     deep = np.uint64(0)
     seen_high = np.uint64(0)
 
+    if lam == 0.0:
+        # ---- plain online TD(0) (original validated path) ----
+        while True:
+            board, state = _spawn(after, state)
+            after2, reward2, legal2, best_val2 = _greedy(board, weights, thresholds, sym_patterns)
+            stage_after = _stage_of(after, thresholds)
+            if not legal2:
+                err = 0.0 - v_after
+                NT.update(after, weights, E, A, stage_after, sym_patterns, lr * err, alpha_floor)
+                return score, _max_exponent(board), deep
+            target = best_val2  # = reward2 + V_{stage(after2)}(after2)
+            err = target - v_after
+            NT.update(after, weights, E, A, stage_after, sym_patterns, lr * err, alpha_floor)
+            score += reward2
+            if collect_min_exp > 0 and _max_exponent(after2) >= collect_min_exp:
+                seen_high += np.uint64(1)
+                r, state = _xorshift(state)
+                if (r % seen_high) == np.uint64(0):
+                    deep = after2
+            after = after2
+            v_after = best_val2 - reward2
+
+    # ---- delayed-TC(lambda): buffer the episode, apply lambda-return at end ----
+    traj_after = np.empty(_LAMBDA_MAXT, dtype=np.uint64)
+    traj_stage = np.empty(_LAMBDA_MAXT, dtype=np.int64)
+    traj_delta = np.empty(_LAMBDA_MAXT, dtype=np.float64)
+    nt = 0
     while True:
-        # spawn a random tile onto the afterstate -> next state
+        if nt == _LAMBDA_MAXT:
+            # buffer full: flush a (truncated) lambda-return pass, then keep going.
+            # Updating mid-episode makes the weights drift, so this is the
+            # bounded-horizon "delayed by h" form -- fine for pathologically
+            # long games; typical games fit well under the cap.
+            acc = 0.0
+            for t in range(nt - 1, -1, -1):
+                acc = traj_delta[t] + lam * acc
+                NT.update(traj_after[t], weights, E, A, traj_stage[t], sym_patterns,
+                          lr * acc, alpha_floor)
+            nt = 0
         board, state = _spawn(after, state)
         after2, reward2, legal2, best_val2 = _greedy(board, weights, thresholds, sym_patterns)
         stage_after = _stage_of(after, thresholds)
         if not legal2:
-            # terminal: target 0 future reward
-            err = 0.0 - v_after
-            NT.update(after, weights, E, A, stage_after, sym_patterns, lr * err, alpha_floor)
-            return score, _max_exponent(board), deep
-        target = best_val2  # = reward2 + V_{stage(after2)}(after2)
-        err = target - v_after
-        NT.update(after, weights, E, A, stage_after, sym_patterns, lr * err, alpha_floor)
+            traj_after[nt] = after
+            traj_stage[nt] = stage_after
+            traj_delta[nt] = 0.0 - v_after
+            nt += 1
+            break
+        traj_after[nt] = after
+        traj_stage[nt] = stage_after
+        traj_delta[nt] = best_val2 - v_after  # delta_t = reward2 + V(after2) - V(after)
+        nt += 1
         score += reward2
-        # reservoir-sample a high-tile afterstate for the restart pool
         if collect_min_exp > 0 and _max_exponent(after2) >= collect_min_exp:
             seen_high += np.uint64(1)
             r, state = _xorshift(state)
             if (r % seen_high) == np.uint64(0):
                 deep = after2
         after = after2
-        v_after = best_val2 - reward2  # = V_{stage(after2)}(after2)
+        v_after = best_val2 - reward2
+
+    acc = 0.0
+    for t in range(nt - 1, -1, -1):
+        acc = traj_delta[t] + lam * acc
+        NT.update(traj_after[t], weights, E, A, traj_stage[t], sym_patterns,
+                  lr * acc, alpha_floor)
+    return score, _max_exponent(board), deep
 
 
 @njit(cache=True, parallel=True)
 def train_batch(seeds, weights, E, A, thresholds, sym_patterns, lr,
-                alpha_floor, start_boards, collect_min_exp,
+                alpha_floor, start_boards, collect_min_exp, lam,
                 out_score, out_maxexp, out_deepboard):
     """Play len(seeds) games in parallel (Hogwild updates to the shared
     weights/E/A). Writes per-game (score, max_exponent, deep_afterstate)
@@ -264,12 +325,13 @@ def train_batch(seeds, weights, E, A, thresholds, sym_patterns, lr,
 
     `alpha_floor` -> TC learning-rate floor (see ntuple.update).
     `start_boards[i]` -> restart afterstate for game i (0 = empty start).
-    `collect_min_exp` -> pool-collection tile threshold (0 = no pooling)."""
+    `collect_min_exp` -> pool-collection tile threshold (0 = no pooling).
+    `lam` -> TD(lambda) decay for delayed TC (0 = plain online TD(0))."""
     n = seeds.shape[0]
     for i in prange(n):
         s, mx, deep = play_and_learn_one(
             seeds[i], weights, E, A, thresholds, sym_patterns, lr,
-            alpha_floor, start_boards[i], collect_min_exp)
+            alpha_floor, start_boards[i], collect_min_exp, lam)
         out_score[i] = s
         out_maxexp[i] = mx
         out_deepboard[i] = deep
