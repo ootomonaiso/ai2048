@@ -113,6 +113,14 @@ def _greedy(board, weights, thresholds, sym_patterns):
     best_value = best_reward + V_{stage(best_after)}(best_after).
     best_after/best_reward are only meaningful when any_legal is True.
     """
+    # NOTE: `any_legal` is set AFTER each value comparison, and the first
+    # legal move is taken via `not any_legal` (not just `v > best_val`).
+    # This guarantees best_after is a REAL legal afterstate even if every
+    # value compares False -- which happens when the net has diverged to
+    # NaN (NaN > x is always False). The old code left best_after at the
+    # uint64(0) sentinel (= empty board) in that case, and the caller fed
+    # it back as the next state, spinning forever (a divergent run hung
+    # instead of just scoring badly). Now divergence terminates normally.
     best_val = -1.0e30
     best_after = np.uint64(0)
     best_reward = 0
@@ -120,36 +128,36 @@ def _greedy(board, weights, thresholds, sym_patterns):
 
     nb, sc, mv = move_left(board)
     if mv:
-        any_legal = True
         v = sc + NT.evaluate(nb, weights, _stage_of(nb, thresholds), sym_patterns)
-        if v > best_val:
+        if (not any_legal) or v > best_val:
             best_val = v
             best_after = nb
             best_reward = sc
+        any_legal = True
     nb, sc, mv = move_right(board)
     if mv:
-        any_legal = True
         v = sc + NT.evaluate(nb, weights, _stage_of(nb, thresholds), sym_patterns)
-        if v > best_val:
+        if (not any_legal) or v > best_val:
             best_val = v
             best_after = nb
             best_reward = sc
+        any_legal = True
     nb, sc, mv = move_up(board)
     if mv:
-        any_legal = True
         v = sc + NT.evaluate(nb, weights, _stage_of(nb, thresholds), sym_patterns)
-        if v > best_val:
+        if (not any_legal) or v > best_val:
             best_val = v
             best_after = nb
             best_reward = sc
+        any_legal = True
     nb, sc, mv = move_down(board)
     if mv:
-        any_legal = True
         v = sc + NT.evaluate(nb, weights, _stage_of(nb, thresholds), sym_patterns)
-        if v > best_val:
+        if (not any_legal) or v > best_val:
             best_val = v
             best_after = nb
             best_reward = sc
+        any_legal = True
 
     return best_after, best_reward, any_legal, best_val
 
@@ -186,11 +194,13 @@ def best_move_net(board, weights, thresholds, sym_patterns):
 
 # --- one self-play game with TD-afterstate(+TC) learning --------------
 _LAMBDA_MAXT = 4096  # trajectory buffer per game for the lambda-return path
+_MAX_MOVES = 200000  # hard episode-length cap (defensive; a real 32768 game is
+                     # ~2-3e4 moves). Stops any runaway game from hanging a run.
 
 
 @njit(cache=True)
 def play_and_learn_one(seed, weights, E, A, thresholds, sym_patterns, lr,
-                       alpha_floor, start_board, collect_min_exp, lam):
+                       alpha_floor, start_board, collect_min_exp, lam, hysteresis):
     """Play one game greedily under the current net while applying
     TD-afterstate + TC updates. Multistage: each afterstate is valued and
     updated at its own stage (empty `thresholds` -> single stage). The TD
@@ -210,6 +220,14 @@ def play_and_learn_one(seed, weights, E, A, thresholds, sym_patterns, lr,
     returns it as `deep` (0 if none qualified), so the driver can grow a
     pool of high-tile states to restart future games from. Uniform over
     all qualifying afterstates in the game (reservoir sampling).
+
+    HYSTERESIS. `hysteresis` in (0,1] scales NEGATIVE update errors (down-
+    moves of V) by that factor; 1.0 = symmetric (off). H<1 is hysteretic
+    TD (Matignon 2007): the learner raises V fast but lowers it slowly, so
+    it stays optimistic and is robust to the downward spawn-noise surprises
+    that make a high lr diverge -- an asymmetric-learning-rate "hysteresis
+    loop" on V. Applied to the per-step error (online) or the lambda-return
+    error (delayed-TC), i.e. at the update boundary for both paths.
 
     DELAYED-TC(lambda). `lam`=0 -> plain online TD(0): each afterstate is
     updated immediately by its 1-step error (the original, validated path,
@@ -247,16 +265,24 @@ def play_and_learn_one(seed, weights, E, A, thresholds, sym_patterns, lr,
 
     if lam == 0.0:
         # ---- plain online TD(0) (original validated path) ----
+        moves = 0
         while True:
+            if moves >= _MAX_MOVES:
+                return score, _max_exponent(board), deep
+            moves += 1
             board, state = _spawn(after, state)
             after2, reward2, legal2, best_val2 = _greedy(board, weights, thresholds, sym_patterns)
             stage_after = _stage_of(after, thresholds)
             if not legal2:
                 err = 0.0 - v_after
+                if err < 0.0:
+                    err *= hysteresis
                 NT.update(after, weights, E, A, stage_after, sym_patterns, lr * err, alpha_floor)
                 return score, _max_exponent(board), deep
             target = best_val2  # = reward2 + V_{stage(after2)}(after2)
             err = target - v_after
+            if err < 0.0:
+                err *= hysteresis
             NT.update(after, weights, E, A, stage_after, sym_patterns, lr * err, alpha_floor)
             score += reward2
             if collect_min_exp > 0 and _max_exponent(after2) >= collect_min_exp:
@@ -272,7 +298,11 @@ def play_and_learn_one(seed, weights, E, A, thresholds, sym_patterns, lr,
     traj_stage = np.empty(_LAMBDA_MAXT, dtype=np.int64)
     traj_delta = np.empty(_LAMBDA_MAXT, dtype=np.float64)
     nt = 0
+    moves = 0
     while True:
+        if moves >= _MAX_MOVES:
+            break
+        moves += 1
         if nt == _LAMBDA_MAXT:
             # buffer full: flush a (truncated) lambda-return pass, then keep going.
             # Updating mid-episode makes the weights drift, so this is the
@@ -281,8 +311,9 @@ def play_and_learn_one(seed, weights, E, A, thresholds, sym_patterns, lr,
             acc = 0.0
             for t in range(nt - 1, -1, -1):
                 acc = traj_delta[t] + lam * acc
+                upd = acc if acc >= 0.0 else acc * hysteresis
                 NT.update(traj_after[t], weights, E, A, traj_stage[t], sym_patterns,
-                          lr * acc, alpha_floor)
+                          lr * upd, alpha_floor)
             nt = 0
         board, state = _spawn(after, state)
         after2, reward2, legal2, best_val2 = _greedy(board, weights, thresholds, sym_patterns)
@@ -309,14 +340,15 @@ def play_and_learn_one(seed, weights, E, A, thresholds, sym_patterns, lr,
     acc = 0.0
     for t in range(nt - 1, -1, -1):
         acc = traj_delta[t] + lam * acc
+        upd = acc if acc >= 0.0 else acc * hysteresis
         NT.update(traj_after[t], weights, E, A, traj_stage[t], sym_patterns,
-                  lr * acc, alpha_floor)
+                  lr * upd, alpha_floor)
     return score, _max_exponent(board), deep
 
 
 @njit(cache=True, parallel=True)
 def train_batch(seeds, weights, E, A, thresholds, sym_patterns, lr,
-                alpha_floor, start_boards, collect_min_exp, lam,
+                alpha_floor, start_boards, collect_min_exp, lam, hysteresis,
                 out_score, out_maxexp, out_deepboard):
     """Play len(seeds) games in parallel (Hogwild updates to the shared
     weights/E/A). Writes per-game (score, max_exponent, deep_afterstate)
@@ -326,12 +358,13 @@ def train_batch(seeds, weights, E, A, thresholds, sym_patterns, lr,
     `alpha_floor` -> TC learning-rate floor (see ntuple.update).
     `start_boards[i]` -> restart afterstate for game i (0 = empty start).
     `collect_min_exp` -> pool-collection tile threshold (0 = no pooling).
-    `lam` -> TD(lambda) decay for delayed TC (0 = plain online TD(0))."""
+    `lam` -> TD(lambda) decay for delayed TC (0 = plain online TD(0)).
+    `hysteresis` -> negative-error scale in (0,1] (1 = symmetric)."""
     n = seeds.shape[0]
     for i in prange(n):
         s, mx, deep = play_and_learn_one(
             seeds[i], weights, E, A, thresholds, sym_patterns, lr,
-            alpha_floor, start_boards[i], collect_min_exp, lam)
+            alpha_floor, start_boards[i], collect_min_exp, lam, hysteresis)
         out_score[i] = s
         out_maxexp[i] = mx
         out_deepboard[i] = deep

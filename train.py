@@ -134,6 +134,10 @@ def main():
                         "spawn-noise variance so a higher --lr becomes viable. VALIDATED FAST RECIPE: "
                         "--td-lambda 0.5 --lr 0.5 (~5x faster per game than the lr-0.1 baseline over a "
                         "300k-game A/B: avg 122k vs 86k, 8192 69%% vs 31%% at 250k games).")
+    parser.add_argument("--hysteresis", type=float, default=1.0, help="HYSTERETIC TD (Matignon 2007): "
+                        "scale NEGATIVE TD errors (down-moves of V) by this factor in (0,1] (1 = off / "
+                        "symmetric). H<1 raises V fast but lowers it slowly -> stays optimistic and "
+                        "robust to downward spawn-noise, which may stabilize a higher --lr. Experimental.")
     args = parser.parse_args()
 
     thresholds = np.array(
@@ -208,6 +212,8 @@ def main():
         log_line(args.ckpt, f"[{_now()}] TC alpha floor = {args.tc_alpha_floor:g}")
     if args.td_lambda != 0.0:
         log_line(args.ckpt, f"[{_now()}] delayed-TC(lambda) ON: lambda={args.td_lambda:g} lr={args.lr:g}")
+    if args.hysteresis != 1.0:
+        log_line(args.ckpt, f"[{_now()}] hysteretic TD ON: neg-error scale={args.hysteresis:g}")
 
     games = meta["games"]
     last_ckpt = games
@@ -244,7 +250,7 @@ def main():
 
             TK.train_batch(seeds, weights, E, A, thresholds, sym, args.lr,
                            args.tc_alpha_floor, start_boards, collect_min_exp, args.td_lambda,
-                           out_score, out_maxexp, out_deepboard)
+                           args.hysteresis, out_score, out_maxexp, out_deepboard)
 
             # fold this batch's sampled high-tile states into the pool
             if use_restart:
@@ -291,6 +297,7 @@ def main():
                 meta["restart_prob"] = args.restart_prob
                 meta["restart_min_exp"] = args.restart_min_exp
                 meta["td_lambda"] = args.td_lambda
+                meta["hysteresis"] = args.hysteresis
                 save_ckpt(args.ckpt, weights, E, A, meta)
                 log_line(args.ckpt, f"[{_now()}] checkpoint saved at {games:,} games "
                                     f"({meta['wall_seconds']/3600:.2f}h wall)")
@@ -305,6 +312,7 @@ def main():
     meta["restart_prob"] = args.restart_prob
     meta["restart_min_exp"] = args.restart_min_exp
     meta["td_lambda"] = args.td_lambda
+    meta["hysteresis"] = args.hysteresis
     save_ckpt(args.ckpt, weights, E, A, meta)
     log_line(args.ckpt, f"[{_now()}] final checkpoint saved at {games:,} games")
 
