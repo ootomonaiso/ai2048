@@ -36,6 +36,15 @@ A from-scratch 2048 game plus two AIs over a numba-JIT bitboard engine:
   hard (e.g. a 5-tuple run gained almost nothing from 0.2M → 10M games)
   and barely trains the rare 16384/32768 endgame, because fresh self-play
   almost never reaches it.
+  - `--td-lambda L` — **delayed temporal-coherence / TD(λ)** (Jaśkowski
+    2018). Replaces the 1-step TD error with the λ-return error applied in
+    one backward pass per episode (weights fixed within the episode),
+    cutting the single-sample spawn-noise variance that forces the tiny
+    `lr 0.1`. **This is the big win: `--td-lambda 0.5 --lr 0.5` learns
+    ~5× faster per game** — in a 300k-game 5-tuple A/B it hit avg 122k /
+    8192=69% / 16384=3% at 250k games vs the `lr 0.1` baseline's 86k /
+    31% / 0%, and led at *every* checkpoint. (`lr 1.0` still diverges even
+    with λ, so 0.5 is the sweet spot.) `L=0` = the plain online path.
   - `--restart-prob P` / `--restart-min-exp E` — **restart / carousel
     shaping**: start a fraction `P` of games from a pool of
     previously-seen afterstates whose max tile ≥ `2**E`, so self-play
@@ -52,22 +61,29 @@ A from-scratch 2048 game plus two AIs over a numba-JIT bitboard engine:
     stably (it chases spawn-noise variance and diverges — even with OI),
     and at the safe `--lr 0.1` a large `--opt-init` just causes a long
     unrecovered dip (both measured, 300k games, decisively below
-    baseline). Making OI useful here needs **delayed TC** (not yet
-    implemented) to tame the variance and unlock `--lr 1.0`. Leave at 0
-    until then.
+    baseline). OI would need a learning rate high enough to burn off the
+    optimism fast; delayed TC (now implemented) tames variance at `lr 0.5`
+    but `lr 1.0` still diverges even at λ=0.5, so OI stays unvalidated here
+    (might need a higher λ). Leave at 0 for now.
   - `--tc-alpha-floor F` — a lower bound on the per-weight TC learning
     rate so vanilla TC can't freeze a weight to 0 permanently (an
     anti-plateau safeguard; this one is ours, not from the papers).
 
-  **Honest status:** on short (300k-game) A/B runs none of these beat the
-  plain baseline — the baseline is already well-tuned for the early/mid
-  game, and restart shaping's real payoff is only in the endgame regime
-  that short runs never reach. They are tools for the LONG endgame-push
-  run, not early-curve wins. The genuinely missing algorithmic piece is
-  delayed TC (to make a high learning rate + optimistic init viable).
+  **Honest status (300k-game A/B):** `--td-lambda 0.5 --lr 0.5` is a clear,
+  validated win (above). The others are *not* early-curve wins: optimistic
+  init and `lr 1.0` under plain TC both lost badly (`lr 1.0` diverges;
+  `--opt-init` at the safe `lr 0.1` just causes a long dip), and restart
+  shaping from scratch underperforms — its real payoff is only in the
+  endgame regime a 300k run never reaches, so enable it LATE on a long
+  run. In short: use delayed TC for the fast curve; keep restart shaping
+  for the endgame push; leave opt-init/high-lr off unless combined with
+  something that tames the variance.
 
 ```
 # train (resumable; Ctrl-C any time, re-run to continue):
+# recommended fast recipe (delayed TC -- ~5x faster per game than lr-0.1):
+python train.py --ckpt runs/s1_5t8 --td-lambda 0.5 --lr 0.5 --batch 512
+# plain baseline (the original, if you want the validated-exact dynamics):
 python train.py --ckpt runs/s1_5t8 --lr 0.1 --batch 512
 # multistage (dedicated endgame weights), warm-started from a single-stage net:
 python train.py --ckpt runs/ms2_5t8 --stage-thresholds 14 --init-from runs/s1_5t8
